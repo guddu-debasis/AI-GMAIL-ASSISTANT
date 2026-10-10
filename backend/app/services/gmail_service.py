@@ -6,6 +6,8 @@ from datetime import datetime, timezone
 import httpx
 from app.core.security import decrypt_token
 
+from app.services.email_parser import extract_plain_text_from_mime, parse_email_headers
+
 logger = logging.getLogger("gmail_assistant.gmail")
 
 
@@ -20,22 +22,22 @@ class GmailService:
         self.use_mock = use_mock
 
     async def list_messages(self, access_token: str, query: str = "label:INBOX", max_results: int = 20) -> List[Dict[str, Any]]:
-        if self.use_mock or not access_token:
+        if self.use_mock and not access_token:
             return self._get_mock_message_list()
 
         headers = {"Authorization": f"Bearer {access_token}"}
         url = "https://gmail.googleapis.com/gmail/v1/users/me/messages"
         params = {"q": query, "maxResults": max_results}
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        async with httpx.AsyncClient(timeout=15.0) as client:
             resp = await client.get(url, headers=headers, params=params)
             if resp.status_code == 401:
-                raise GmailAPIError("Gmail token expired or revoked")
+                raise GmailAPIError("Gmail token expired or revoked. Please re-authenticate.")
             resp.raise_for_status()
             data = resp.json()
             return data.get("messages", [])
 
     async def fetch_message(self, access_token: str, message_id: str) -> Dict[str, Any]:
-        if self.use_mock or not access_token:
+        if self.use_mock and not access_token:
             mock_item = self._get_mock_message_by_id(message_id)
             if mock_item:
                 return mock_item
@@ -44,23 +46,40 @@ class GmailService:
         headers = {"Authorization": f"Bearer {access_token}"}
         url = f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{message_id}"
         params = {"format": "full"}
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        async with httpx.AsyncClient(timeout=15.0) as client:
             resp = await client.get(url, headers=headers, params=params)
             if resp.status_code == 401:
-                raise GmailAPIError("Gmail token expired or revoked")
+                raise GmailAPIError("Gmail token expired or revoked. Please re-authenticate.")
             resp.raise_for_status()
-            return resp.json()
+            data = resp.json()
+
+            # Normalize real Gmail API message format
+            payload = data.get("payload", {})
+            header_list = payload.get("headers", [])
+            headers_dict = parse_email_headers(header_list)
+            body_text = extract_plain_text_from_mime(payload)
+            labels = data.get("labelIds", [])
+
+            return {
+                "id": data.get("id"),
+                "threadId": data.get("threadId"),
+                "labelIds": labels,
+                "headers": headers_dict,
+                "snippet": data.get("snippet", ""),
+                "body": body_text or data.get("snippet", ""),
+                "is_starred": "STARRED" in labels,
+            }
 
     async def fetch_thread(self, access_token: str, thread_id: str) -> Dict[str, Any]:
-        if self.use_mock or not access_token:
+        if self.use_mock and not access_token:
             return {"id": thread_id, "messages": [self._get_mock_message_by_id(thread_id) or {}]}
 
         headers = {"Authorization": f"Bearer {access_token}"}
         url = f"https://gmail.googleapis.com/gmail/v1/users/me/threads/{thread_id}"
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        async with httpx.AsyncClient(timeout=15.0) as client:
             resp = await client.get(url, headers=headers)
             if resp.status_code == 401:
-                raise GmailAPIError("Gmail token expired or revoked")
+                raise GmailAPIError("Gmail token expired or revoked. Please re-authenticate.")
             resp.raise_for_status()
             return resp.json()
 
@@ -74,7 +93,7 @@ class GmailService:
         body: str,
     ) -> Dict[str, Any]:
         """Creates a draft in Gmail. Never sends it."""
-        if self.use_mock or not access_token:
+        if self.use_mock and not access_token:
             return {"id": f"mock_draft_{message_id}", "message": {"id": f"msg_draft_{message_id}", "threadId": thread_id}}
 
         headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
@@ -91,7 +110,7 @@ class GmailService:
             }
         }
         url = "https://gmail.googleapis.com/gmail/v1/users/me/drafts"
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        async with httpx.AsyncClient(timeout=15.0) as client:
             resp = await client.post(url, headers=headers, json=payload)
             resp.raise_for_status()
             return resp.json()
@@ -109,13 +128,16 @@ class GmailService:
         Sends reply message directly via Gmail API.
         Must only be called by dedicated SendService after final authorization!
         """
-        if self.use_mock or not access_token:
-            # Simulate real send
+        if self.use_mock and not access_token:
+            # Simulate send ONLY in mock test fixture mode
             return {
                 "id": f"mock_sent_{datetime.now(timezone.utc).timestamp()}",
                 "threadId": thread_id,
                 "status": "SENT",
             }
+
+        if not access_token:
+            raise GmailAPIError("Cannot send email: No active Gmail OAuth access token found. Please connect your Gmail account.")
 
         headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
         raw_mime = self._construct_mime_message(
@@ -129,9 +151,12 @@ class GmailService:
             "raw": base64.urlsafe_b64encode(raw_mime.as_bytes()).decode("utf-8"),
         }
         url = "https://gmail.googleapis.com/gmail/v1/users/me/messages/send"
-        async with httpx.AsyncClient(timeout=15.0) as client:
+        async with httpx.AsyncClient(timeout=20.0) as client:
             resp = await client.post(url, headers=headers, json=payload)
-            resp.raise_for_status()
+            if resp.status_code == 401:
+                raise GmailAPIError("Gmail access token has expired. Please re-authenticate.")
+            if resp.status_code != 200:
+                raise GmailAPIError(f"Gmail API send failed ({resp.status_code}): {resp.text}")
             return resp.json()
 
     def _construct_mime_message(
@@ -242,3 +267,40 @@ def get_gmail_service(account: Optional[Any] = None) -> GmailService:
         if decrypted:
             use_mock = False
     return GmailService(use_mock=use_mock)
+
+
+async def refresh_google_access_token(db: Any, account: Any) -> str:
+    """
+    Refreshes an expired Google OAuth access token using stored refresh_token_encrypted.
+    Updates the database with the new encrypted access token and new expiry timestamp.
+    """
+    if not account or not getattr(account, "refresh_token_encrypted", None):
+        raise GmailAPIError("No refresh token stored. Re-authorization via Google OAuth required.")
+
+    from datetime import timedelta
+    from app.core.config import settings
+    from app.core.security import encrypt_token
+
+    refresh_token = decrypt_token(account.refresh_token_encrypted)
+    data = {
+        "client_id": settings.GOOGLE_CLIENT_ID,
+        "client_secret": settings.GOOGLE_CLIENT_SECRET,
+        "refresh_token": refresh_token,
+        "grant_type": "refresh_token",
+    }
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        resp = await client.post("https://oauth2.googleapis.com/token", data=data)
+        if resp.status_code != 200:
+            account.status = "needs_reauth"
+            await db.commit()
+            raise GmailAPIError(f"Google token refresh failed ({resp.status_code}). Please re-connect your Gmail account.")
+        tokens = resp.json()
+
+    new_access_token = tokens["access_token"]
+    account.access_token_encrypted = encrypt_token(new_access_token)
+    expires_in = tokens.get("expires_in", 3600)
+    account.token_expiry = datetime.now(timezone.utc) + timedelta(seconds=expires_in)
+    account.status = "connected"
+    await db.commit()
+    logger.info("Successfully refreshed Google access token for %s", account.gmail_address)
+    return new_access_token

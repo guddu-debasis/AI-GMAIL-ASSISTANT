@@ -7,37 +7,83 @@ import type {
   GmailStatus,
   ReplyDraft 
 } from '../types';
+import type { AuthUser } from '../types/auth';
 
-const API_BASE = 'http://localhost:8000/api/v1';
+const API_ROOT: string = import.meta.env.VITE_API_URL ?? 'http://localhost:8000';
+const API_BASE = `${API_ROOT}/api/v1`;
 
-async function request<T>(endpoint: string, options?: RequestInit): Promise<T> {
-  const url = `${API_BASE}${endpoint}`;
-  const res = await fetch(url, {
-    headers: {
-      'Content-Type': 'application/json',
-      'X-User-Email': 'demo.user@example.com',
-      ...(options?.headers || {}),
-    },
-    ...options,
-  });
+// Clerk's getToken() only exists inside React components (the useAuth hook).
+// App.tsx hands it to us here, so every request can carry a fresh session token.
+type TokenGetter = () => Promise<string | null>;
+let tokenGetter: TokenGetter | null = null;
+
+export function setTokenGetter(getter: TokenGetter | null): void {
+  tokenGetter = getter;
+}
+
+function extractErrorMessage(body: unknown, fallback: string): string {
+  if (body && typeof body === 'object' && 'detail' in body) {
+    const detail = (body as { detail: unknown }).detail;
+    if (typeof detail === 'string') return detail;
+    if (Array.isArray(detail)) {
+      // FastAPI validation errors: [{ msg: "..." }, ...]
+      const messages = detail
+        .map((d) => (d && typeof d === 'object' && 'msg' in d ? String((d as { msg: unknown }).msg) : ''))
+        .filter(Boolean);
+      if (messages.length > 0) return messages.join('. ');
+    }
+  }
+  return fallback;
+}
+
+async function request<T>(
+  endpoint: string,
+  options: RequestInit = {},
+  base: string = API_BASE,
+): Promise<T> {
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+    ...((options.headers as Record<string, string> | undefined) || {}),
+  };
+
+  if (tokenGetter) {
+    try {
+      const token = await tokenGetter();
+      if (token) headers['Authorization'] = `Bearer ${token}`;
+    } catch {
+      // no token available, the server will answer 401 and the UI will show it
+    }
+  }
+
+  let res: Response;
+  try {
+    res = await fetch(`${base}${endpoint}`, { ...options, headers });
+  } catch {
+    throw new Error(`Cannot reach the server at ${API_ROOT}. Is the backend running?`);
+  }
 
   if (!res.ok) {
-    let errorMsg = 'An error occurred';
+    const text = await res.text();
+    let parsed: unknown = null;
     try {
-      const errJson = await res.json();
-      errorMsg = errJson.detail || JSON.stringify(errJson);
+      parsed = JSON.parse(text);
     } catch {
-      errorMsg = await res.text();
+      // not JSON, fall back to raw text
     }
-    throw new Error(errorMsg);
+    throw new Error(extractErrorMessage(parsed, text || 'An error occurred'));
   }
 
   return res.json();
 }
 
 export const api = {
+  // Auth: sign in and sign up happen in Clerk. This only asks our backend "who am I".
+  // The first call after a new sign up also creates the local user row.
+  me: () => request<AuthUser>('/auth/me', {}, API_ROOT),
+
   // Gmail
   getGmailStatus: () => request<GmailStatus>('/gmail/status'),
+  getGoogleAuthUrl: () => request<{ auth_url?: string; message?: string }>('/auth/google/start', {}, API_ROOT),
   syncInbox: () => request<{ message: string; synced_count: number; drafted_count: number }>('/gmail/sync', { method: 'POST' }),
 
   // Emails

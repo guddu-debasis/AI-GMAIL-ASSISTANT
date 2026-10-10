@@ -3,14 +3,28 @@ import {
   Lock, 
   UserPlus, 
   Trash2, 
-  Save 
+  Save,
+  Mail,
+  CheckCircle2,
+  AlertTriangle,
+  ExternalLink,
+  ShieldCheck
 } from 'lucide-react';
-import type { UserSettings, VIPSender } from '../types';
+import type { UserSettings, VIPSender, GmailStatus } from '../types';
 import { api } from '../api/client';
 
-export const SettingsView: React.FC = () => {
+interface SettingsViewProps {
+  gmailStatus?: GmailStatus | null;
+  onConnectGmail?: () => void;
+}
+
+export const SettingsView: React.FC<SettingsViewProps> = ({
+  gmailStatus: initialGmailStatus,
+  onConnectGmail
+}) => {
   const [settings, setSettings] = useState<UserSettings | null>(null);
   const [vipSenders, setVipSenders] = useState<VIPSender[]>([]);
+  const [gmailStatus, setGmailStatus] = useState<GmailStatus | null>(initialGmailStatus || null);
   const [newVipEmail, setNewVipEmail] = useState('');
   const [loading, setLoading] = useState(false);
   const [feedback, setFeedback] = useState<string | null>(null);
@@ -19,13 +33,41 @@ export const SettingsView: React.FC = () => {
     loadData();
   }, []);
 
+  useEffect(() => {
+    if (initialGmailStatus) {
+      setGmailStatus(initialGmailStatus);
+    }
+  }, [initialGmailStatus]);
+
   const loadData = async () => {
     try {
-      const [s, v] = await Promise.all([api.getSettings(), api.getVIPSenders()]);
+      const [s, v, g] = await Promise.all([
+        api.getSettings(), 
+        api.getVIPSenders(),
+        api.getGmailStatus().catch(() => null)
+      ]);
       setSettings(s);
       setVipSenders(v);
+      if (g) setGmailStatus(g);
     } catch (err) {
       console.error(err);
+    }
+  };
+
+  const handleConnect = async () => {
+    if (onConnectGmail) {
+      onConnectGmail();
+      return;
+    }
+    try {
+      const res = await api.getGoogleAuthUrl();
+      if (res.auth_url) {
+        window.location.href = res.auth_url;
+      } else {
+        alert(res.message || 'Google OAuth is not configured yet. Please configure GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET.');
+      }
+    } catch (err: any) {
+      alert(`Failed to start Google OAuth: ${err.message}`);
     }
   };
 
@@ -119,6 +161,70 @@ export const SettingsView: React.FC = () => {
           {feedback}
         </div>
       )}
+
+      {/* 0. Live Gmail API Integration */}
+      <div className="glass-panel" style={{ padding: '24px', marginBottom: '24px' }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', flexWrap: 'wrap', gap: '16px' }}>
+          <div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '10px', marginBottom: '6px' }}>
+              <Mail size={20} color="#818cf8" />
+              <h3 style={{ fontSize: '1.05rem', fontWeight: 600, color: '#ffffff' }}>
+                Google Gmail Integration
+              </h3>
+              {gmailStatus?.connected ? (
+                <span className="badge badge-sent" style={{ display: 'inline-flex', alignItems: 'center', gap: '4px' }}>
+                  <CheckCircle2 size={13} /> Real Gmail API Connected
+                </span>
+              ) : (
+                <span className="badge badge-requires-approval" style={{ display: 'inline-flex', alignItems: 'center', gap: '4px' }}>
+                  <AlertTriangle size={13} /> Sandbox / Not Connected
+                </span>
+              )}
+            </div>
+            <p style={{ fontSize: '0.825rem', color: 'var(--text-muted)', maxWidth: '640px', lineHeight: 1.5 }}>
+              {gmailStatus?.connected ? (
+                <>
+                  Connected account: <strong style={{ color: '#f8fafc' }}>{gmailStatus.gmail_address}</strong>. Real emails are synced from your live Gmail inbox and replies are dispatched through Google's official Gmail API (<span className="code-mono">messages.send</span>) upon your human approval.
+                </>
+              ) : (
+                <>
+                  Connect your real Google account via official OAuth 2.0 to sync live Gmail messages and dispatch real, authenticated email replies directly from your address.
+                </>
+              )}
+            </p>
+          </div>
+
+          <div>
+            <button
+              type="button"
+              className="btn btn-primary"
+              onClick={handleConnect}
+              style={{ display: 'inline-flex', alignItems: 'center', gap: '8px' }}
+            >
+              <ExternalLink size={15} />
+              {gmailStatus?.connected ? 'Reconnect / Switch Google Account' : 'Connect Real Gmail Account'}
+            </button>
+          </div>
+        </div>
+
+        <div style={{ 
+          marginTop: '16px', 
+          padding: '12px 16px', 
+          borderRadius: '8px', 
+          background: 'rgba(99, 102, 241, 0.08)', 
+          border: '1px solid rgba(99, 102, 241, 0.2)',
+          fontSize: '0.8rem',
+          color: '#c7d2fe',
+          display: 'flex',
+          alignItems: 'center',
+          gap: '8px'
+        }}>
+          <ShieldCheck size={16} color="#818cf8" style={{ flexShrink: 0 }} />
+          <span>
+            <strong>Deterministic Safety &amp; Real Dispatch:</strong> Auto-send is permanently disabled by default. Every outgoing message requires your review, preserving full RFC 2822 threading headers (<span className="code-mono">In-Reply-To</span> and <span className="code-mono">References</span>) in Gmail.
+          </span>
+        </div>
+      </div>
 
       {/* 1. Protected Categories */}
       <div className="glass-panel" style={{ padding: '24px', marginBottom: '24px' }}>

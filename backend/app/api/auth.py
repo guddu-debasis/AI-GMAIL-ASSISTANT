@@ -1,6 +1,6 @@
 import urllib.parse
 from typing import Optional
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import RedirectResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -10,9 +10,11 @@ from app.api.deps import get_current_user, get_db
 from app.models.user import User
 from app.models.gmail_account import GmailAccount
 from app.core.config import settings
-from app.core.security import encrypt_token
+from app.core.security import create_access_token, decode_token, encrypt_token
 
-router = APIRouter(prefix="/auth/google", tags=["Authentication"])
+# This router connects a Gmail account to an already logged in app user.
+# App login itself lives in app/api/auth_local.py.
+router = APIRouter(prefix="/auth/google", tags=["Gmail Connection"])
 
 SCOPES = [
     "https://www.googleapis.com/auth/gmail.readonly",
@@ -22,12 +24,17 @@ SCOPES = [
 
 
 @router.get("/start")
-async def google_oauth_start():
+async def google_oauth_start(user: User = Depends(get_current_user)):
     if not settings.GOOGLE_CLIENT_ID:
         return {
             "message": "Google Client ID not configured. Sandbox mock mode is active for testing.",
             "auth_url": None,
         }
+
+    # The browser comes back from Google without our Authorization header.
+    # A short-lived signed "state" tells the callback which user started this,
+    # and also protects against forged callbacks (CSRF).
+    state = create_access_token(user.id, purpose="oauth_state", expires_minutes=10)
 
     params = {
         "client_id": settings.GOOGLE_CLIENT_ID,
@@ -36,6 +43,7 @@ async def google_oauth_start():
         "scope": " ".join(SCOPES),
         "access_type": "offline",
         "prompt": "consent",
+        "state": state,
     }
     url = f"https://accounts.google.com/o/oauth2/v2/auth?{urllib.parse.urlencode(params)}"
     return {"auth_url": url}
@@ -45,11 +53,19 @@ async def google_oauth_start():
 async def google_oauth_callback(
     code: Optional[str] = Query(None),
     error: Optional[str] = Query(None),
-    user: User = Depends(get_current_user),
+    state: Optional[str] = Query(None),
     db: AsyncSession = Depends(get_db),
 ):
     if error or not code:
         raise HTTPException(status_code=400, detail=f"OAuth authorization failed: {error}")
+
+    user_id = decode_token(state or "", purpose="oauth_state")
+    if not user_id:
+        raise HTTPException(status_code=400, detail="Invalid or expired OAuth state. Start the connection again.")
+
+    user = await db.get(User, user_id)
+    if not user:
+        raise HTTPException(status_code=400, detail="Invalid OAuth state")
 
     token_url = "https://oauth2.googleapis.com/token"
     data = {
@@ -83,6 +99,10 @@ async def google_oauth_callback(
     res = await db.execute(stmt)
     account = res.scalar_one_or_none()
 
+    from datetime import datetime, timezone, timedelta
+    expires_in = tokens.get("expires_in", 3600)
+    token_expiry = datetime.now(timezone.utc) + timedelta(seconds=expires_in)
+
     if not account:
         account = GmailAccount(
             user_id=user.id,
@@ -90,18 +110,26 @@ async def google_oauth_callback(
             gmail_address=gmail_email,
             access_token_encrypted=encrypt_token(access_token),
             refresh_token_encrypted=encrypt_token(refresh_token) if refresh_token else None,
+            token_expiry=token_expiry,
             scopes=tokens.get("scope", "").split(),
             status="connected",
         )
         db.add(account)
     else:
+        # If this was previously a mock demo account, purge mock emails so only real messages display
+        if account.google_subject == "sub_mock_12345":
+            from app.models.email import Email
+            from sqlalchemy import delete
+            await db.execute(delete(Email).where(Email.gmail_account_id == account.id))
+
         account.google_subject = google_sub
         account.gmail_address = gmail_email
         account.access_token_encrypted = encrypt_token(access_token)
         if refresh_token:
             account.refresh_token_encrypted = encrypt_token(refresh_token)
+        account.token_expiry = token_expiry
         account.status = "connected"
 
     await db.commit()
     # Redirect to frontend dashboard
-    return RedirectResponse(url="/?oauth=success")
+    return RedirectResponse(url=f"{settings.FRONTEND_URL}/?oauth=success")

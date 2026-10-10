@@ -100,8 +100,41 @@ async def sync_emails(
     llm_provider = get_llm_provider()
     reply_gen = ReplyGenerator(llm_provider)
 
-    access_token = decrypt_token(account.access_token_encrypted) if account.access_token_encrypted else ""
-    messages_meta = await gmail_service.list_messages(access_token)
+    from app.services.gmail_service import refresh_google_access_token, GmailAPIError
+
+    access_token = ""
+    if account and account.access_token_encrypted:
+        # Check expiry safely (handling both naive SQLite and aware datetimes)
+        is_expired = False
+        if account.token_expiry:
+            expiry = account.token_expiry
+            if expiry.tzinfo is None:
+                expiry = expiry.replace(tzinfo=timezone.utc)
+            is_expired = (expiry - datetime.now(timezone.utc)).total_seconds() < 120
+
+        if is_expired and account.refresh_token_encrypted:
+            try:
+                access_token = await refresh_google_access_token(db, account)
+            except Exception as ref_err:
+                logger.warning("Token refresh failed during sync: %s", ref_err)
+                access_token = decrypt_token(account.access_token_encrypted)
+        else:
+            access_token = decrypt_token(account.access_token_encrypted)
+
+    if account and account.access_token_encrypted and not access_token and not gmail_service.use_mock:
+        raise HTTPException(
+            status_code=400,
+            detail="Google token encryption key changed. Please click 'Reconnect / Switch Google Account' to re-authorize once.",
+        )
+
+    try:
+        messages_meta = await gmail_service.list_messages(access_token, max_results=5)
+    except GmailAPIError as g_err:
+        if "expired" in str(g_err).lower() and account and account.refresh_token_encrypted:
+            access_token = await refresh_google_access_token(db, account)
+            messages_meta = await gmail_service.list_messages(access_token, max_results=5)
+        else:
+            raise HTTPException(status_code=400, detail=str(g_err))
 
     synced_count = 0
     drafted_count = 0

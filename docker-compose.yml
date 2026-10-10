@@ -42,6 +42,9 @@ services:
       APP_SECRET_KEY: dev_production_secret_key_change_me!
       OAUTH_TOKEN_ENCRYPTION_KEY: dGhpcy1pcy1hLTMyLWJ5dGUtc2VjcmV0LWtleS1mb3ItZGV2IQ==
       LOG_LEVEL: INFO
+      # Clerk login: set these in your shell or in a .env file next to this compose file
+      CLERK_PUBLISHABLE_KEY: ${CLERK_PUBLISHABLE_KEY:-}
+      CLERK_SECRET_KEY: ${CLERK_SECRET_KEY:-}
     ports:
       - "8000:8000"
 

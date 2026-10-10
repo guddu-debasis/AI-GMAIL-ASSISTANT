@@ -1,44 +1,40 @@
-from typing import AsyncGenerator, Optional
-from fastapi import Depends, Header, HTTPException, status
-from sqlalchemy import select
+from typing import Optional
+from fastapi import Depends, HTTPException, status
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.ext.asyncio import AsyncSession
+from app.core.clerk_auth import ClerkAuthError, ClerkNotConfiguredError, verify_clerk_token
 from app.core.database import get_db
 from app.models.user import User
-from app.models.user_settings import UserSettings
-from app.core.config import settings
+from app.services.user_service import get_or_create_clerk_user
+
+# auto_error=False so we can return a clean 401 with our own message
+bearer_scheme = HTTPBearer(auto_error=False)
+
+
+def _unauthorized(detail: str) -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail=detail,
+        headers={"WWW-Authenticate": "Bearer"},
+    )
 
 
 async def get_current_user(
-    x_user_email: Optional[str] = Header(default="demo.user@example.com"),
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(bearer_scheme),
     db: AsyncSession = Depends(get_db),
 ) -> User:
     """
-    Dependency to resolve the acting authenticated user.
-    Supports multi-user isolation via X-User-Email header.
-    Automatically seeds default user and initial user settings on first access.
+    Resolves the acting user from the "Authorization: Bearer <Clerk session token>" header.
+    The token is signed by Clerk, so the caller cannot pick which user they are.
     """
-    email = (x_user_email or "demo.user@example.com").strip().lower()
-    stmt = select(User).where(User.email == email)
-    res = await db.execute(stmt)
-    user = res.scalar_one_or_none()
+    if credentials is None or not credentials.credentials:
+        raise _unauthorized("Not authenticated")
 
-    if not user:
-        user = User(email=email)
-        db.add(user)
-        await db.flush()
+    try:
+        claims = await verify_clerk_token(credentials.credentials)
+    except ClerkNotConfiguredError as exc:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc))
+    except ClerkAuthError as exc:
+        raise _unauthorized(str(exc))
 
-        # Seed initial user settings with required defaults (README Section 2)
-        user_settings = UserSettings(
-            user_id=user.id,
-            approval_categories=list(settings.DEFAULT_APPROVAL_CATEGORIES),
-            approve_when_uncertain=settings.DEFAULT_APPROVE_WHEN_UNCERTAIN,
-            approve_starred=settings.DEFAULT_APPROVE_STARRED,
-            allow_auto_send=settings.DEFAULT_ALLOW_AUTO_SEND,
-            min_confidence=settings.DEFAULT_MIN_CONFIDENCE,
-            policy_version=1,
-        )
-        db.add(user_settings)
-        await db.commit()
-        await db.refresh(user)
-
-    return user
+    return await get_or_create_clerk_user(db, claims)

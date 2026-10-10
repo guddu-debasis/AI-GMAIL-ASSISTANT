@@ -85,18 +85,58 @@ class SendService:
         # 6. Execute send through GmailService
         gmail_service = get_gmail_service(gmail_account)
         access_token = ""
+
+        from app.services.gmail_service import refresh_google_access_token, GmailAPIError
+
         if gmail_account and gmail_account.access_token_encrypted:
-            access_token = decrypt_token(gmail_account.access_token_encrypted)
+            # Check if token is expired or expiring soon (within 2 minutes)
+            is_expired = False
+            if gmail_account.token_expiry:
+                expiry = gmail_account.token_expiry
+                if expiry.tzinfo is None:
+                    expiry = expiry.replace(tzinfo=timezone.utc)
+                is_expired = (expiry - datetime.now(timezone.utc)).total_seconds() < 120
+
+            if is_expired and gmail_account.refresh_token_encrypted:
+                try:
+                    access_token = await refresh_google_access_token(self.db, gmail_account)
+                except Exception as ref_err:
+                    logger.warning("Token refresh failed before send: %s", ref_err)
+                    access_token = decrypt_token(gmail_account.access_token_encrypted)
+            else:
+                access_token = decrypt_token(gmail_account.access_token_encrypted)
+
+        if not access_token and not gmail_service.use_mock:
+            raise SendServiceError(
+                "Cannot send real email: No connected Gmail account with active credentials found. Please click 'Connect Gmail' to connect your Google account.",
+                status_code=400,
+            )
 
         try:
-            send_result = await gmail_service.send_approved_reply(
-                access_token=access_token,
-                thread_id=email.gmail_thread_id,
-                message_id=email.gmail_message_id,
-                recipient=email.sender,
-                subject=email.subject or "Re:",
-                body=draft.body,
-            )
+            try:
+                send_result = await gmail_service.send_approved_reply(
+                    access_token=access_token,
+                    thread_id=email.gmail_thread_id,
+                    message_id=email.gmail_message_id,
+                    recipient=email.sender,
+                    subject=email.subject or "Re:",
+                    body=draft.body,
+                )
+            except GmailAPIError as g_err:
+                # If access token expired just now, try one refresh and retry
+                if "expired" in str(g_err).lower() and gmail_account and gmail_account.refresh_token_encrypted:
+                    logger.info("Access token expired during send. Refreshing and retrying...")
+                    access_token = await refresh_google_access_token(self.db, gmail_account)
+                    send_result = await gmail_service.send_approved_reply(
+                        access_token=access_token,
+                        thread_id=email.gmail_thread_id,
+                        message_id=email.gmail_message_id,
+                        recipient=email.sender,
+                        subject=email.subject or "Re:",
+                        body=draft.body,
+                    )
+                else:
+                    raise
 
             # 7. Record SENT state and audit trail
             draft.status = "SENT"

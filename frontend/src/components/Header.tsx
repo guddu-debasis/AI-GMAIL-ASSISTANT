@@ -6,7 +6,8 @@ import {
   Inbox, 
   Settings, 
   History, 
-  RefreshCw 
+  RefreshCw,
+  LogOut
 } from 'lucide-react';
 import type { GmailStatus } from '../types';
 
@@ -17,6 +18,9 @@ interface HeaderProps {
   gmailStatus: GmailStatus | null;
   onSync: () => void;
   isSyncing: boolean;
+  userEmail: string;
+  onLogout: () => void;
+  onConnectGmail: () => void;
 }
 
 export const Header: React.FC<HeaderProps> = ({
@@ -26,6 +30,9 @@ export const Header: React.FC<HeaderProps> = ({
   gmailStatus,
   onSync,
   isSyncing,
+  userEmail,
+  onLogout,
+  onConnectGmail,
 }) => {
   return (
     <header className="glass-panel" style={{ margin: '16px 24px', padding: '16px 24px', borderRadius: '16px' }}>
@@ -60,8 +67,8 @@ export const Header: React.FC<HeaderProps> = ({
           </div>
         </div>
 
-        {/* Status & Sync Action */}
-        <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+        {/* Status, Sync Action and Account */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: '12px', flexWrap: 'wrap' }}>
           <div style={{ 
             display: 'flex', 
             alignItems: 'center', 
@@ -84,6 +91,18 @@ export const Header: React.FC<HeaderProps> = ({
             </span>
           </div>
 
+          {(!gmailStatus?.connected || !gmailStatus?.gmail_address) && (
+            <button 
+              className="btn btn-secondary"
+              onClick={onConnectGmail}
+              id="connect-gmail-button"
+              style={{ fontSize: '0.825rem', borderColor: 'rgba(99, 102, 241, 0.4)', color: '#c7d2fe' }}
+            >
+              <Mail size={14} color="#818cf8" />
+              Connect Real Gmail
+            </button>
+          )}
+
           <button 
             className="btn btn-primary"
             onClick={onSync}
@@ -93,6 +112,37 @@ export const Header: React.FC<HeaderProps> = ({
             <RefreshCw size={15} className={isSyncing ? 'animate-spin' : ''} style={{ animation: isSyncing ? 'spin 1s linear infinite' : 'none' }} />
             {isSyncing ? 'Syncing...' : 'Sync Inbox'}
           </button>
+
+          <div style={{ 
+            display: 'flex', 
+            alignItems: 'center', 
+            gap: '10px', 
+            paddingLeft: '12px', 
+            borderLeft: '1px solid var(--border-subtle)' 
+          }}>
+            <span 
+              title={userEmail}
+              style={{ 
+                fontSize: '0.8rem', 
+                color: 'var(--text-muted)', 
+                maxWidth: '180px', 
+                overflow: 'hidden', 
+                textOverflow: 'ellipsis', 
+                whiteSpace: 'nowrap' 
+              }}
+            >
+              {userEmail}
+            </span>
+            <button 
+              className="btn btn-secondary"
+              onClick={onLogout}
+              id="logout-button"
+              style={{ fontSize: '0.8rem', padding: '6px 12px' }}
+            >
+              <LogOut size={14} />
+              Log out
+            </button>
+          </div>
         </div>
       </div>
 
